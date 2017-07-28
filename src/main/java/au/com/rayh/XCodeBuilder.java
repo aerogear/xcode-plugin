@@ -43,6 +43,7 @@ import hudson.util.CopyOnWriteList;
 import hudson.util.QuotedStringTokenizer;
 import jenkins.tasks.SimpleBuildStep;
 import org.apache.commons.lang.StringUtils;
+import org.apache.commons.lang.WordUtils;
 import org.jenkinsci.plugins.tokenmacro.MacroEvaluationException;
 import org.jenkinsci.plugins.tokenmacro.TokenMacro;
 import org.kohsuke.stapler.DataBoundConstructor;
@@ -211,6 +212,23 @@ public class XCodeBuilder extends Builder implements SimpleBuildStep {
     private String flags;
 
     private EnvVars env;
+
+    public boolean status;
+
+    public enum BuildConfig {
+        DEBUG("debug"),
+        RELEASE("release");
+
+        private String config;
+
+        BuildConfig(String config) {
+            this.config = config;
+        }
+
+        public String getConfig() {
+            return WordUtils.capitalize(config);
+        }
+    }
     
     // Fields in config.jelly must match the parameter names in the "DataBoundConstructor"
     @DataBoundConstructor
@@ -320,7 +338,17 @@ public class XCodeBuilder extends Builder implements SimpleBuildStep {
 
         // Start expanding all string variables in parameters
         // NOTE: we currently use variable shadowing to avoid having to rewrite all code (and break pull requests), this will be cleaned up at later stage.
-        String configuration = envs.expand(this.configuration);
+        BuildConfig cfg;
+
+        try {
+            cfg = BuildConfig.valueOf(configuration.toUpperCase());
+        } catch (IllegalArgumentException e) {
+            listener.getLogger().println("Invalid build configration \"" + configuration + "\" type, it should be either \"Debug\" or \"Release\".");
+            status = false;
+            return false;
+        }
+
+        String configuration = envs.expand(cfg.getConfig());
         String target = envs.expand(this.target);
         String sdk = envs.expand(this.sdk);
         String symRoot = envs.expand(this.symRoot);
@@ -365,6 +393,7 @@ public class XCodeBuilder extends Builder implements SimpleBuildStep {
                 symRootValue = TokenMacro.expandAll(build, projectRoot, listener, symRoot).trim();
             } catch (MacroEvaluationException e) {
                 listener.error(Messages.XCodeBuilder_symRootMacroError(e.getMessage()));
+                status = false;
                 return false;
             }
         }
@@ -376,6 +405,7 @@ public class XCodeBuilder extends Builder implements SimpleBuildStep {
                 buildDirValue = TokenMacro.expandAll(build, projectRoot, listener, buildDir).trim();
             } catch (MacroEvaluationException e) {
                 listener.error(Messages.XCodeBuilder_buildDirMacroError(e.getMessage()));
+                status = false;
                 return false;
             }
         }
@@ -395,6 +425,7 @@ public class XCodeBuilder extends Builder implements SimpleBuildStep {
         int returnCode = launcher.launch().envs(envs).cmds(getGlobalConfiguration().getXcodebuildPath(), "-version").stdout(listener).pwd(projectRoot).join();
         if (returnCode > 0) {
             listener.fatalError(Messages.XCodeBuilder_xcodeVersionNotFound());
+            status = false;
             return false; // We fail the build if XCode isn't deployed
         }
 
@@ -439,6 +470,7 @@ public class XCodeBuilder extends Builder implements SimpleBuildStep {
 
         	if (returnCode > 0) {
         		listener.fatalError(Messages.XCodeBuilder_CFBundleIdentifierInfoPlistNotFound(bundleIDInfoPlistPath));
+        		status = false;
         		return false;
         	}
         }
@@ -453,11 +485,13 @@ public class XCodeBuilder extends Builder implements SimpleBuildStep {
                 returnCode = launcher.launch().envs(envs).cmds(getGlobalConfiguration().getAgvtoolPath(), "new-marketing-version", cfBundleShortVersionString).stdout(listener).pwd(projectRoot).join();
                 if (returnCode > 0) {
                     listener.fatalError(Messages.XCodeBuilder_CFBundleShortVersionStringUpdateError(cfBundleShortVersionString));
+                    status = false;
                     return false;
                 }
             } catch (MacroEvaluationException e) {
                 listener.fatalError(Messages.XCodeBuilder_CFBundleShortVersionStringMacroError(e.getMessage()));
                 // Fails the build
+                status = false;
                 return false;
             }
         }
@@ -472,11 +506,13 @@ public class XCodeBuilder extends Builder implements SimpleBuildStep {
                 returnCode = launcher.launch().envs(envs).cmds(getGlobalConfiguration().getAgvtoolPath(), "new-version", "-all", cfBundleVersion).stdout(listener).pwd(projectRoot).join();
                 if (returnCode > 0) {
                     listener.fatalError(Messages.XCodeBuilder_CFBundleVersionUpdateError(cfBundleVersion));
+                    status = false;
                     return false;
                 }
             } catch (MacroEvaluationException e) {
                 listener.fatalError(Messages.XCodeBuilder_CFBundleVersionMacroError(e.getMessage()));
                 // Fails the build
+                status = false;
                 return false;
             }
         }
@@ -502,6 +538,7 @@ public class XCodeBuilder extends Builder implements SimpleBuildStep {
             if(keychain == null)
             {
                 listener.fatalError(Messages.XCodeBuilder_keychainNotConfigured());
+                status = false;
                 return false;
             }
 
@@ -516,6 +553,7 @@ public class XCodeBuilder extends Builder implements SimpleBuildStep {
 
             if (returnCode > 0) {
                 listener.fatalError(Messages.XCodeBuilder_unlockKeychainFailed());
+                status = false;
                 return false;
             }
 
@@ -534,6 +572,7 @@ public class XCodeBuilder extends Builder implements SimpleBuildStep {
             Team team = getDevelopmentTeam();
             if (team == null) {
                 listener.fatalError(Messages.XCodeBuilder_teamNotConfigured());
+                status = false;
                 return false;
             }
             String developmentTeamID = envs.expand(team.getTeamID());
@@ -567,7 +606,10 @@ public class XCodeBuilder extends Builder implements SimpleBuildStep {
             String xcodeBuildListOutput = baos.toString("UTF-8");
             listener.getLogger().println(xcodeBuildListOutput);
             boolean timedOut = returnCode == SIGTERM;
-            if (returnCode > 0 && !timedOut) return false;
+            if (returnCode > 0 && !timedOut) {
+                status = false;
+                return false;
+            }
 
             xcodebuildListParser = new XcodeBuildListParser(xcodeBuildListOutput);
         }
@@ -589,6 +631,7 @@ public class XCodeBuilder extends Builder implements SimpleBuildStep {
         } else if(interpretTargetAsRegEx != null && interpretTargetAsRegEx) {
             if(xcodebuildListParser.getTargets().isEmpty()) {
                 listener.getLogger().println(Messages.XCodeBuilder_NoTargetsFoundInConfig());
+                status = false;
                 return false;
             }
             Collection<String> matchedTargets = Collections2.filter(xcodebuildListParser.getTargets(),
@@ -596,6 +639,7 @@ public class XCodeBuilder extends Builder implements SimpleBuildStep {
 
             if (matchedTargets.isEmpty()) {
                 listener.getLogger().println(Messages.XCodeBuilder_NoMatchingTargetsFound());
+                status = false;
                 return false;
             }
 
@@ -702,8 +746,14 @@ public class XCodeBuilder extends Builder implements SimpleBuildStep {
         listener.getLogger().println(xcodeReport.toString());
         returnCode = launcher.launch().envs(envs).cmds(commandLine).stdout(reportGenerator.getOutputStream()).pwd(projectRoot).join();
         if (allowFailingBuildResults != null && !allowFailingBuildResults) {
-            if (reportGenerator.getExitCode() != 0) return false;
-            if (returnCode > 0) return false;
+            if (reportGenerator.getExitCode() != 0) {
+                status = false;
+                return false;
+            }
+            if (returnCode > 0) {
+                status = false;
+                return false;
+            }
         }
 
         // Package IPA
@@ -711,6 +761,7 @@ public class XCodeBuilder extends Builder implements SimpleBuildStep {
 
             if (!buildDirectory.exists() || !buildDirectory.isDirectory()) {
                 listener.fatalError(Messages.XCodeBuilder_NotExistingBuildDirectory(buildDirectory.absolutize().getRemote()));
+                status = false;
                 return false;
             }
 
@@ -752,6 +803,7 @@ public class XCodeBuilder extends Builder implements SimpleBuildStep {
             // FilePath is based on File.listFiles() which can randomly fail | http://stackoverflow.com/questions/3228147/retrieving-the-underlying-error-when-file-listfiles-return-null
             if (archives == null) {
                 listener.fatalError(Messages.XCodeBuilder_NoArchivesInBuildDirectory(buildDirectory.absolutize().getRemote()));
+                status = false;
                 return false;
             }
 
@@ -774,11 +826,13 @@ public class XCodeBuilder extends Builder implements SimpleBuildStep {
                 }
                 catch(Exception ex) {
                     listener.getLogger().println("Failed to get version from Info.plist: " + ex.toString());
+                    status = false;
                     return false;
                 }
 
                	if (StringUtils.isEmpty(version) && StringUtils.isEmpty(shortVersion)) {
                		listener.getLogger().println("You have to provide a value for either the marketing or technical version. Found neither.");
+               		status = false;
                		return false;
                	}
 
@@ -815,6 +869,7 @@ public class XCodeBuilder extends Builder implements SimpleBuildStep {
                 returnCode = launcher.launch().envs(envs).stdout(listener).pwd(projectRoot).cmds(packageCommandLine).join();
                 if (returnCode > 0) {
                     listener.getLogger().println("Failed to build " + ipaLocation.absolutize().getRemote());
+                    status = false;
                     return false;
                 }
                 //rename exported ipa
@@ -849,6 +904,7 @@ public class XCodeBuilder extends Builder implements SimpleBuildStep {
 
                         if (returnCode > 0) {
                             listener.getLogger().println(Messages.XCodeBuilder_zipFailed(baseName));
+                            status = false;
                             return false;
                         }
                     }
@@ -886,7 +942,9 @@ public class XCodeBuilder extends Builder implements SimpleBuildStep {
             }
         }
 
-        return true;
+        status = true;
+
+        return status;
     }
 
     public Keychain getKeychain() {
