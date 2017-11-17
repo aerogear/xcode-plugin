@@ -32,6 +32,7 @@ import java.util.List;
 import java.util.UUID;
 import hudson.model.Run;
 import hudson.model.TaskListener;
+import org.kohsuke.stapler.DataBoundSetter;
 
 import javax.annotation.Nonnull;
 
@@ -44,7 +45,7 @@ import javax.annotation.Nonnull;
  * @author Kohsuke Kawaguchi
  */
 @SuppressFBWarnings("NP_NULL_ON_SOME_PATH_FROM_RETURN_VALUE")
-public class DeveloperProfileLoader extends Builder implements SimpleBuildStep {
+public class DeveloperProfileLoaderWrapper extends Builder implements SimpleBuildStep {
     private final String id;
     private boolean isProjectScoped;
     private String keychainPassword;
@@ -53,10 +54,11 @@ public class DeveloperProfileLoader extends Builder implements SimpleBuildStep {
     private boolean defaultKeychain;
 
     @DataBoundConstructor
-    public DeveloperProfileLoader(String profileId) {
+    public DeveloperProfileLoaderWrapper(String profileId) {
         this.id = profileId;
     }
 
+    @DataBoundSetter
     public void setProjectScope(boolean value) {
         this.isProjectScoped = value;
     }
@@ -72,10 +74,12 @@ public class DeveloperProfileLoader extends Builder implements SimpleBuildStep {
         _perform(build, filePath, launcher, taskListener);
     }
 
+
     public String getKeychainPassword() {
         return keychainPassword;
     }
 
+    @DataBoundSetter
     public void setKeychainPassword(String keychainPassword) {
         this.keychainPassword = keychainPassword;
     }
@@ -117,45 +121,34 @@ public class DeveloperProfileLoader extends Builder implements SimpleBuildStep {
         if (dp==null)
             throw new AbortException("No Apple developer profile is configured");
 
-        // Note: keychain are usualy suffixed with .keychain. If we change we should probably clean up the ones we created
-        String keyChain = "jenkins-"+build.getFullDisplayName().replace('/', '-');
-        this.keychainName = keyChain;
-        String keychainPass;
-
-        if (this.keychainPassword != null) {
-            keychainPass = this.keychainPassword;
-        } else {
-            keychainPass = UUID.randomUUID().toString();
-        }
-
-        this.keychainPassword = keychainPass;
-
+        generateKeychainName(build);
+        generateKeychainPass();
         ArgumentListBuilder args;
 
         {// if the key chain is already present, delete it and start fresh
             ByteArrayOutputStream out = new ByteArrayOutputStream();
-            args = new ArgumentListBuilder("security","delete-keychain", keyChain);
+            args = new ArgumentListBuilder("security","delete-keychain", this.keychainName);
             launcher.launch().cmds(args).stdout(out).join();
         }
 
         args = new ArgumentListBuilder("security","create-keychain");
-        args.add("-p").addMasked(keychainPass);
-        args.add(keyChain);
+        args.add("-p").addMasked(this.keychainPassword);
+        args.add(this.keychainName);
         invoke(launcher, listener, args, "Failed to create a keychain");
 
         args = new ArgumentListBuilder("security","unlock-keychain");
-        args.add("-p").addMasked(keychainPass);
-        args.add(keyChain);
+        args.add("-p").addMasked(this.keychainPassword);
+        args.add(this.keychainName);
         invoke(launcher, listener, args, "Failed to unlock keychain");
 
         if (this.defaultKeychain) {
             args = new ArgumentListBuilder("security", "default-keychain");
             args.add("-d").add("user");
-            args.add(keyChain);
+            args.add(this.keychainName);
             invoke(launcher, listener, args, "Failed to set default keychain");
         }
 
-        final FilePath secret = getSecretDir(filePath, keychainPass);
+        final FilePath secret = getSecretDir(filePath, build);
 
         try {
             secret.unzipFrom(new ByteArrayInputStream(dp.getImage()));
@@ -167,37 +160,23 @@ public class DeveloperProfileLoader extends Builder implements SimpleBuildStep {
         for (FilePath id : secret.list("**/*.p12")) {
 
             args = new ArgumentListBuilder("security","import");
-            args.add(id).add("-k",keyChain);
+            args.add(id).add("-k",this.keychainName);
             args.add("-P").addMasked(dp.getPassword().getPlainText());
             args.add("-T","/usr/bin/codesign");
             args.add("-T","/usr/bin/productsign");
-            args.add(keyChain);
+            args.add(this.keychainName);
             invoke(launcher, listener, args, "Failed to import identity "+id);
         }
 
         {
             // display keychain info for potential troubleshooting
             args = new ArgumentListBuilder("security","show-keychain-info");
-            args.add(keyChain);
+            args.add(this.keychainName);
             ByteArrayOutputStream output = invoke(launcher, listener, args, "Failed to show keychain info");
             listener.getLogger().write(output.toByteArray());
         }
 
-        // copy provisioning profiles
-        VirtualChannel ch = filePath.getChannel();
-        FilePath home = filePath.getHomeDirectory(ch);
-        FilePath profiles = home.child("Library/MobileDevice/Provisioning Profiles");
-        profiles.mkdirs();
-
-        for (FilePath mp : secret.list("**/*.mobileprovision")) {
-            this.provisioningpProfileName = mp.getName();
-            listener.getLogger().println("Installing  " + mp.getName());
-            if (profiles.child(this.provisioningpProfileName).exists()) {
-                String uuid = UUID.randomUUID().toString();
-                this.provisioningpProfileName = uuid + ".mobileprovision";
-            }
-            mp.copyTo(profiles.child(this.provisioningpProfileName));
-        }
+        copyProvisionsionProfile(filePath, secret, listener);
 
         if (!this.isProjectScoped) {
             this.setPerms(launcher, listener);
@@ -224,6 +203,10 @@ public class DeveloperProfileLoader extends Builder implements SimpleBuildStep {
 
     public FilePath getSecretDir(FilePath path) throws IOException, InterruptedException {
         return this.getSecretDir(path, this.keychainPassword);
+    }
+
+    public FilePath getSecretDir(FilePath path, Run<?, ?> build) throws IOException, InterruptedException {
+        return this.getSecretDir(path, this.getProfileFolder(build));
     }
 
     public DeveloperProfile getProfile() {
@@ -254,7 +237,52 @@ public class DeveloperProfileLoader extends Builder implements SimpleBuildStep {
         return id;
     }
 
-    public void unload(FilePath filePath, Launcher launcher, TaskListener listener) throws InterruptedException, IOException {
+    public void generateKeychainName(Run<?, ?> build){
+        // Note: keychain are usualy suffixed with .keychain. If we change we should probably clean up the ones we created
+        this.keychainName = "jenkins-" + build.getFullDisplayName().replace('/', '-');
+    }
+
+    public String getProfileFolder(Run<?, ?> build) {
+        return build.getFullDisplayName()
+                .replace('/', '-')
+                .replace(" ", "");
+    }
+
+    public void generateKeychainPass(){
+        String keychainPass;
+
+        if (this.keychainPassword != null) {
+            keychainPass = this.keychainPassword;
+        } else {
+            keychainPass = UUID.randomUUID().toString();
+        }
+
+        this.keychainPassword = keychainPass;
+
+    }
+    public void copyProvisionsionProfile(FilePath filePath, FilePath secret, TaskListener listener) throws InterruptedException, IOException{
+
+        // copy provisioning profiles
+        VirtualChannel ch = filePath.getChannel();
+        FilePath home = filePath.getHomeDirectory(ch);
+        FilePath profiles = home.child("Library/MobileDevice/Provisioning Profiles");
+        profiles.mkdirs();
+
+        for (FilePath mp : secret.list("**/*.mobileprovision")) {
+            this.provisioningpProfileName = mp.getName();
+            listener.getLogger().println("Installing  " + mp.getName());
+            if (profiles.child(this.provisioningpProfileName).exists()) {
+                String uuid = UUID.randomUUID().toString();
+                this.provisioningpProfileName = uuid + ".mobileprovision";
+            }
+            mp.copyTo(profiles.child(this.provisioningpProfileName));
+        }
+    }
+
+    public void unload(Run<?, ?> build, FilePath filePath, Launcher launcher, TaskListener listener) throws InterruptedException, IOException {
+        generateKeychainPass();
+        generateKeychainName(build);
+        copyProvisionsionProfile(filePath, getSecretDir(filePath, build), listener);
         ArgumentListBuilder args = new ArgumentListBuilder("security", "delete-keychain", this.keychainName);
         ByteArrayOutputStream output = invoke(launcher, listener, args, "Failed to remove keychain");
         listener.getLogger().write(output.toByteArray());
@@ -262,7 +290,7 @@ public class DeveloperProfileLoader extends Builder implements SimpleBuildStep {
                 .getHomeDirectory(filePath.getChannel())
                 .child("Library/MobileDevice/Provisioning Profiles")
                 .child(this.provisioningpProfileName).delete();
-        FilePath profilePath = this.getSecretDir(filePath, this.keychainPassword);
+        FilePath profilePath = this.getSecretDir(filePath, build);
         profilePath.deleteRecursive();
     }
 

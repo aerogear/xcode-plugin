@@ -106,19 +106,19 @@ public class CodeSignStep extends AbstractStepImpl {
             String buildName = build.getFullDisplayName();
             String keychainName = "jenkins-" + buildName.replace('/', '-');
 
-            DeveloperProfileLoader profileLoader = new DeveloperProfileLoader(profileId);
+            DeveloperProfileLoaderWrapper profileLoader = new DeveloperProfileLoaderWrapper(profileId);
             profileLoader.setProjectScope(false);
             profileLoader.perform(build, workspace, launcher, listener);
 
             CodeSignWrapper codesign = new CodeSignWrapper(appPath,
                     keychainName,
-                    profileLoader.getSecretDir(workspace),
+                    profileLoader.getSecretDir(workspace, build),
                     clean,
                     verify,
                     ipaName);
             codesign.perform(build, workspace, launcher, listener);
 
-            profileLoader.unload(workspace, launcher, listener);
+            profileLoader.unload(build, workspace, launcher, listener);
 
             if (!codesign.result) {
                 throw  new AbortException("Error while running the build job.");
